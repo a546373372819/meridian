@@ -22,4 +22,5 @@ message ApplyAppConfigCommand {
   string seccompProfile = 4;
   map<string, double> quotas = 5;
   string strategy = 6;
+  bool terminate = 7;
 }

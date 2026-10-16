@@ -11,5 +11,11 @@ type ResourceQuotas map[string]float64
 type ResourceQuotaStore interface {
 	// todo: remove tx from the interface
 	SetResourceQuotas(entityId string, quotas ResourceQuotas, tx neo4j.Transaction) error
-	GetAvailableResources(tx neo4j.Transaction, entityId string) (ResourceQuotas, error)
+  
+	GetEffectiveAvailableResources(tx neo4j.Transaction, entityId string) (ResourceQuotas, error)
+  
+	// returns the entitys own total quotas
+	GetResourceQuotas(entityId string) (ResourceQuotas, error)
+  
+	ListAppIds() ([]string, error)
 }

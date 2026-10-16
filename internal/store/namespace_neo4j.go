@@ -64,8 +64,7 @@ func (n *namespaceNeo4jStore) Add(namespace domain.Namespace, parent *domain.Nam
 		tx.Rollback()
 		return err
 	}
-	tx.Commit()
-	return nil
+	return tx.Commit()
 }
 
 func (n *namespaceNeo4jStore) Get(id string) (domain.Namespace, error) {
@@ -136,9 +135,9 @@ func (n *namespaceNeo4jStore) get(tx neo4j.Transaction, id string) (domain.Names
 		return domain.Namespace{}, err
 	}
 	if len(namespaces) == 0 {
-		return domain.Namespace{}, fmt.Errorf("cannot find namespace %s", id)
+		return domain.Namespace{}, domain.NotFound("cannot find namespace %s", id)
 	}
-	available, err := n.quotas.GetAvailableResources(tx, namespaces[0].GetId())
+	available, err := n.quotas.GetEffectiveAvailableResources(tx, namespaces[0].GetId())
 	if err != nil {
 		return domain.Namespace{}, err
 	}
@@ -161,7 +160,7 @@ func (n *namespaceNeo4jStore) getChildren(tx neo4j.Transaction, namespace domain
 		return nil, err
 	}
 	for _, namespace := range namespaces {
-		available, err := n.quotas.GetAvailableResources(tx, namespace.GetId())
+		available, err := n.quotas.GetEffectiveAvailableResources(tx, namespace.GetId())
 		if err != nil {
 			return nil, err
 		}

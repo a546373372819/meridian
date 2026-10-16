@@ -15,6 +15,8 @@ service Meridian {
   rpc GetNamespaceHierarchy(GetNamespaceHierarchyReq) returns (GetNamespaceHierarchyResp) {}
   rpc SetNamespaceResources(SetNamespaceResourcesReq) returns (SetNamespaceResourcesResp) {}
   rpc SetAppResources(SetAppResourcesReq) returns (SetAppResourcesResp) {}
+  rpc BorrowResources(BorrowResourcesReq) returns (BorrowResourcesResp) {}
+  rpc ReturnResources(ReturnResourcesReq) returns (ReturnResourcesResp) {}
 }
 
 message AddNamespaceReq {
@@ -51,6 +53,12 @@ message RemoveAppReq {
     string orgId = 1;
     string namespace = 2;
     string name = 3;
+    // optional, an app that inherits the terminated apps resources, empty - just delete.
+    string successorApp = 4;
+    //the successors namespace
+    //empty - same namespace as the terminated app
+    //a different namespace makes it a cross namespace borrow owed to the terminated apps namespace
+    string successorNamespace = 5;
 }
 
 message RemoveAppResp {}
@@ -108,3 +116,28 @@ message SetAppResourcesReq {
 }
 
 message SetAppResourcesResp {}
+
+
+message BorrowResourcesReq {
+    string orgId = 1;
+    string fromNamespace = 2;
+    string fromApp = 3;
+    string toNamespace = 4;
+    string toApp = 5;
+    string resource = 6;
+    double amount = 7;
+}
+
+message BorrowResourcesResp {}
+
+message ReturnResourcesReq {
+    string orgId = 1;
+    string fromNamespace = 2;
+    string fromApp = 3;
+    string toNamespace = 4;
+    string toApp = 5;
+    string resource = 6;
+    double amount = 7;
+}
+
+message ReturnResourcesResp {}

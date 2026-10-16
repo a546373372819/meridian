@@ -49,8 +49,7 @@ func (a *appNeo4jStore) Add(app domain.App) error {
 		tx.Rollback()
 		return err
 	}
-	tx.Commit()
-	return nil
+	return tx.Commit()
 }
 
 func (a *appNeo4jStore) FindChildren(namespace domain.Namespace) ([]domain.App, error) {

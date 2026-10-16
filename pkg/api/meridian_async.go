@@ -42,7 +42,7 @@ func (c *MeridianAsyncClient) ReceiveConfig(handler ApplyAppConfigHandler) error
 			log.Println(err)
 			return
 		}
-		err = handler(cmd.OrgId, cmd.NamespaceName, cmd.AppName, cmd.SeccompProfile, cmd.Strategy, cmd.Quotas)
+		err = handler(cmd.OrgId, cmd.NamespaceName, cmd.AppName, cmd.SeccompProfile, cmd.Strategy, cmd.Quotas, cmd.Terminate)
 		if err != nil {
 			log.Println(err)
 		}
@@ -56,7 +56,7 @@ func (c *MeridianAsyncClient) GracefulStop() {
 	}
 }
 
-type ApplyAppConfigHandler func(orgId, namespaceName, appName, seccompProfile, strategy string, quotas map[string]float64) error
+type ApplyAppConfigHandler func(orgId, namespaceName, appName, seccompProfile, strategy string, quotas map[string]float64, terminate bool) error
 
 func Subject(nodeId string) string {
 	return fmt.Sprintf("%s.app_config", nodeId)

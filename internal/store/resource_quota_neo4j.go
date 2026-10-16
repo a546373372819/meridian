@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"log"
+	"math"
 
 	"github.com/c12s/meridian/internal/domain"
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
@@ -23,20 +24,28 @@ func NewResourceQuotaNeo4jStore(driver neo4j.Driver, dbName string) domain.Resou
 	}
 }
 
+// validates and writes an entitys quotas
 func (n *resourceQuotaNeo4jStore) SetResourceQuotas(entityId string, quotas domain.ResourceQuotas, tx neo4j.Transaction) error {
-	if tx == nil {
+	for resource, quota := range quotas {
+		if quota < 0 || math.IsNaN(quota) || math.IsInf(quota, 0) {
+			return domain.Invalid("quota for %s must be a finite number >= 0, got %g", resource, quota)
+		}
+	}
+
+	owned := tx == nil
+	if owned {
 		session := startSession(n.driver, n.dbName)
 		defer endSession(session)
 		newTx, err := session.BeginTransaction()
 		if err != nil {
 			return err
 		}
+		defer newTx.Close()
 		tx = newTx
 	}
 
 	total, err := n.getQuotas(tx, entityId)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
 
@@ -44,37 +53,92 @@ func (n *resourceQuotaNeo4jStore) SetResourceQuotas(entityId string, quotas doma
 	if err != nil {
 		log.Println(err)
 	} else {
-		availableParent, err := n.GetAvailableResources(tx, parentEntityId)
+
+		availableParent, err := n.GetEffectiveAvailableResources(tx, parentEntityId)
 		if err != nil {
-			tx.Rollback()
 			return err
 		}
 		for resource, quota := range quotas {
 			if available := availableParent[resource] + total[resource]; available < quota {
-				return fmt.Errorf("requested %f quota for the resource %s, but only %f available in parent", quota, resource, available)
+				return domain.Precondition("requested %f quota for the resource %s, but only %f available in parent", quota, resource, available)
 			}
 		}
 	}
 
-	available, err := n.GetAvailableResources(tx, entityId)
+	committed, err := n.committedResources(tx, entityId, total)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
 	for resource, quota := range quotas {
-		utilized := total[resource] - available[resource]
-		if utilized > quota {
-			return fmt.Errorf("requested %f quota for the resource %s, but %f already utilized", quota, resource, utilized)
+		if c := committed[resource]; c > quota {
+			return domain.Precondition("requested %f quota for the resource %s, but %f already committed", quota, resource, c)
 		}
 	}
 
-	err = n.setResourceQuotas(tx, entityId, quotas)
-	if err != nil {
-		tx.Rollback()
+	if err := n.setResourceQuotas(tx, entityId, quotas); err != nil {
 		return err
 	}
-	tx.Commit()
+	if owned {
+		return tx.Commit()
+	}
 	return nil
+}
+
+// the minimum quota an entity can be set to, loan aware
+func (n *resourceQuotaNeo4jStore) committedResources(tx neo4j.Transaction, entityId string, total domain.ResourceQuotas) (domain.ResourceQuotas, error) {
+	if domain.IsAppId(entityId) {
+		return borrowedByTx(tx, entityId)
+	}
+	effective, err := n.GetEffectiveAvailableResources(tx, entityId)
+	if err != nil {
+		return nil, err
+	}
+	committed := make(domain.ResourceQuotas)
+	for _, resource := range domain.SupportedResourceQuotas {
+		if avail, ok := effective[resource]; ok {
+			committed[resource] = total[resource] - avail
+		}
+	}
+	return committed, nil
+}
+
+// returns the id of every app (org/ns/app) in the graph
+func (n *resourceQuotaNeo4jStore) ListAppIds() ([]string, error) {
+	session := startSession(n.driver, n.dbName)
+	defer endSession(session)
+	res, err := session.Run(listEntityIdsCypher, nil)
+	if err != nil {
+		return nil, err
+	}
+	records, err := res.Collect()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, rec := range records {
+		idAny, _ := rec.Get("id")
+		if id, ok := idAny.(string); ok && domain.IsAppId(id) {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+// returns every entity id
+const listEntityIdsCypher = `
+MATCH (a:Entity)
+RETURN a.id AS id;
+`
+
+func (n *resourceQuotaNeo4jStore) GetResourceQuotas(entityId string) (domain.ResourceQuotas, error) {
+	session := startSession(n.driver, n.dbName)
+	defer endSession(session)
+	tx, err := session.BeginTransaction()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	return n.getQuotas(tx, entityId)
 }
 
 func (n *resourceQuotaNeo4jStore) getQuotas(tx neo4j.Transaction, id string) (domain.ResourceQuotas, error) {
@@ -97,7 +161,10 @@ func (n *resourceQuotaNeo4jStore) getParentEntity(tx neo4j.Transaction, entityId
 	return n.readEntityId(res)
 }
 
-func (n *resourceQuotaNeo4jStore) GetAvailableResources(tx neo4j.Transaction, entityId string) (domain.ResourceQuotas, error) {
+// unallocated budget of an entity, loan-aware: its total minus what each child
+// really consumes (child.total - borrowedIn(child) + borrowedOut(child)),
+// adjusted for what the entity itself borrowed/lent
+func (n *resourceQuotaNeo4jStore) GetEffectiveAvailableResources(tx neo4j.Transaction, entityId string) (domain.ResourceQuotas, error) {
 	if tx == nil {
 		session := startSession(n.driver, n.dbName)
 		defer endSession(session)
@@ -105,38 +172,47 @@ func (n *resourceQuotaNeo4jStore) GetAvailableResources(tx neo4j.Transaction, en
 		if err != nil {
 			return nil, err
 		}
+		defer newTx.Close()
 		tx = newTx
 	}
 
-	quotas := make(map[string]float64)
+	quotas := make(domain.ResourceQuotas)
 	for _, resourceName := range domain.SupportedResourceQuotas {
-		res, err := tx.Run(getAvailableResourcesCypher, map[string]any{
+		res, err := tx.Run(getEffectiveAvailableCypher, map[string]any{
 			"id":            entityId,
 			"resource_name": resourceName,
 		})
 		if err != nil {
 			return nil, err
 		}
-		if res.Err() != nil {
-			return nil, res.Err()
-		}
 		records, err := res.Collect()
 		if err != nil {
 			return nil, err
 		}
 		if len(records) == 0 || len(records[0].Values) == 0 {
-			return nil, fmt.Errorf("available resources not found for resource %s", resourceName)
+			continue
 		}
-		availableAny := records[0].Values[0]
-		available, ok := availableAny.(float64)
-		if !ok {
-			log.Printf("available resources for %s cannot be converted to float: %v", resourceName, availableAny)
-		} else {
-			quotas[resourceName] = available
+		if v, ok := records[0].Values[0].(float64); ok {
+			quotas[resourceName] = v
 		}
 	}
 	return quotas, nil
 }
+
+const getEffectiveAvailableCypher = `
+MATCH (n:Entity{id: $id})
+OPTIONAL MATCH (n)-[:CHILD]->(d:Entity)
+WITH n,
+     coalesce(d[$resource_name], 0) AS dq,
+     reduce(s = 0.0, x IN [(d)-[b:BORROWED {resource: $resource_name}]->(:Entity) | b.amount] | s + x) AS borrowedIn,
+     reduce(s = 0.0, x IN [(:Entity)-[b:BORROWED {resource: $resource_name}]->(d) | b.amount] | s + x) AS borrowedOut
+WITH n, collect(dq - borrowedIn + borrowedOut) AS consumptions
+WITH n, coalesce(n[$resource_name], 0) - reduce(s = 0.0, c IN consumptions | s + c) AS childAvail
+RETURN childAvail
+     + reduce(s = 0.0, x IN [(n)-[b:BORROWED {resource: $resource_name}]->(:Entity) | b.amount] | s + x)
+     - reduce(s = 0.0, x IN [(:Entity)-[b:BORROWED {resource: $resource_name}]->(n) | b.amount] | s + x)
+     AS available;
+`
 
 func (n *resourceQuotaNeo4jStore) setResourceQuotas(tx neo4j.Transaction, entityId string, quotas domain.ResourceQuotas) error {
 	for resource, quota := range quotas {
@@ -160,7 +236,7 @@ func (n *resourceQuotaNeo4jStore) readEntityId(res neo4j.Result) (string, error)
 		return "", err
 	}
 	if len(records) == 0 {
-		return "", fmt.Errorf("entity not found")
+		return "", domain.NotFound("entity not found")
 	}
 	record := records[0]
 	propertiesAny, found := record.Get("properties")
@@ -191,7 +267,7 @@ func (n *resourceQuotaNeo4jStore) readQuotas(res neo4j.Result) (domain.ResourceQ
 		return nil, err
 	}
 	if len(records) == 0 {
-		return nil, fmt.Errorf("entity not found")
+		return nil, domain.NotFound("entity not found")
 	}
 	record := records[0]
 	propertiesAny, found := record.Get("properties")
@@ -225,15 +301,6 @@ RETURN properties(p) AS properties;
 const getEntityCypher = `
 MATCH (e:Entity{id: $id})
 RETURN properties(e) AS properties;
-`
-
-const getAvailableResourcesCypher = `
-MATCH (n:Entity{id: $id})
-OPTIONAL MATCH (d:Entity)<-[:CHILD]-(n)
-WITH n, collect(d[$resource_name]) as utilized_list
-WITH reduce(total_utilized = 0, utilized in utilized_list | total_utilized + utilized) AS total_utilized,
-	 n[$resource_name] AS total
-RETURN total - total_utilized AS available;
 `
 
 func setQuotaCypher(resource string) string {

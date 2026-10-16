@@ -1,4 +1,4 @@
-FROM golang:1.22.3 as builder
+FROM golang:1.27 as builder
 
 WORKDIR /app
 
@@ -7,6 +7,8 @@ COPY ./pulsar ../pulsar
 COPY ./oort ../oort
 COPY ./magnetar ../magnetar
 COPY ./gravity ../gravity
+COPY ./tug ../tug
+COPY ./starometry ../starometry
 RUN go mod download
 
 COPY ./meridian/ .

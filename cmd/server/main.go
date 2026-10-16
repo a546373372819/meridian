@@ -1,19 +1,25 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	gravityapi "github.com/c12s/gravity/pkg/api"
 	magnetarapi "github.com/c12s/magnetar/pkg/api"
 	"github.com/c12s/meridian/internal/handlers"
+	"github.com/c12s/meridian/internal/metrics"
+	"github.com/c12s/meridian/internal/nodes"
 	"github.com/c12s/meridian/internal/services"
 	"github.com/c12s/meridian/internal/store"
 	"github.com/c12s/meridian/pkg/api"
+	"github.com/c12s/meridian/pkg/appref"
 	oortapi "github.com/c12s/oort/pkg/api"
 	pulsar_api "github.com/c12s/pulsar/model/protobuf"
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
@@ -33,6 +39,8 @@ func main() {
 	quotas := store.NewResourceQuotaNeo4jStore(driver, dbName)
 	apps := store.NewAppNeo4jStore(driver, dbName, quotas)
 	namespaces := store.NewNamespaceNeo4jStore(driver, dbName, quotas, apps)
+	loans := store.NewLoanNeo4jStore(driver, dbName)
+	transfer := store.NewTransferNeo4jStore(driver, dbName)
 	conn, err := grpc.NewClient(os.Getenv("PULSAR_ADDRESS"), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatal(err)
@@ -43,7 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer connGravity.Close()
 	gravity := gravityapi.NewAgentQueueClient(connGravity)
 	administrator, err := oortapi.NewAdministrationAsyncClient(os.Getenv("NATS_ADDRESS"))
 	if err != nil {
@@ -53,10 +61,58 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer connMagnetar.Close()
 	magnetar := magnetarapi.NewMagnetarClient(connMagnetar)
 	authorizer := services.NewAuthZService(os.Getenv("SECRET_KEY"))
-	meridian := handlers.NewMeridianGrpcHandler(namespaces, apps, pulsar, quotas, administrator, gravity, magnetar, authorizer)
+
+	dispatcher := nodes.NewDispatcher(magnetar, gravity, authorizer)
+	accessor := store.NewQuotaStoreAccessor(quotas)
+	borrow := services.NewBorrowService(accessor, loans, transfer, dispatcher)
+	terminate := services.NewTerminationService(accessor, apps, borrow, dispatcher)
+	meridian := handlers.NewMeridianGrpcHandler(namespaces, apps, quotas, loans, pulsar, administrator,
+		authorizer, dispatcher, borrow, terminate)
+
+	// automatic stress-borrowing loop
+	if addrs := os.Getenv("STAROMETRY_ADDRESSES"); addrs != "" {
+		if source, err := metrics.NewGRPCSource(strings.Split(addrs, ",")...); err != nil {
+			log.Println("stress borrowing disabled (metrics source):", err)
+		} else {
+			provider := metrics.NewUtilizationProvider(
+				source,
+				accessor,
+				appref.AppID,
+			)
+			controller := services.NewStressController(provider, accessor, borrow, loans)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stressResources := []string{"mem"}
+			if rs := os.Getenv("STRESS_RESOURCES"); rs != "" {
+				stressResources = strings.Split(rs, ",")
+			}
+			
+			interval := 30 * time.Second
+			if iv := os.Getenv("STRESS_INTERVAL"); iv != "" {
+				if d, err := time.ParseDuration(iv); err == nil {
+					interval = d
+				}
+			}
+			go controller.Run(ctx, stressResources, interval)
+			log.Println("stress borrowing loop started; resources:", stressResources, "interval:", interval)
+		}
+	}
+
+	// reconciliation loop
+	if iv := os.Getenv("RECONCILE_INTERVAL"); iv != "" {
+		if d, err := time.ParseDuration(iv); err != nil {
+			log.Println("reconciler disabled: bad RECONCILE_INTERVAL:", err)
+		} else {
+			reconciler := services.NewReconciler(accessor, borrow)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go reconciler.Run(ctx, d)
+			log.Println("reconciler started, interval", d)
+		}
+	}
 
 	//s := grpc.NewServer()
 	s := grpc.NewServer(grpc.UnaryInterceptor(handlers.GetAuthInterceptor()))

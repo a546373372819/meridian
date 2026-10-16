@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -15,6 +16,16 @@ type AuthZService struct {
 
 func NewAuthZService(key string) AuthZService {
 	return AuthZService{key: key}
+}
+
+// issues an authz-token signed with this services key
+func (s AuthZService) MintToken(username string, permissions []string) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username":    username,
+		"permissions": strings.Join(permissions, ","),
+		"exp":         time.Now().Add(time.Hour).Unix(),
+	})
+	return token.SignedString([]byte(s.key))
 }
 
 func (s AuthZService) Authorize(ctx context.Context, permName string, objKind string, objId string) error {
